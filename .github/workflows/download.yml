@@ -11,6 +11,7 @@ concurrency:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   download:
@@ -18,6 +19,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true  # Enable Git LFS for large files
+
+      - name: Configure Git LFS
+        run: |
+          git lfs track "*.mp4"
+          git lfs track "*.zip"
+          git lfs track "*.part*"
+          git config lfs.concurrenttransfers 10
+          git add .gitattributes
 
       - name: Install Deno (JavaScript runtime for yt-dlp)
         uses: denoland/setup-deno@v2
@@ -34,82 +45,57 @@ jobs:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           if [ -n "$YOUTUBE_COOKIES" ]; then
-            # Create proper Netscape format cookies file
-            # First line MUST be the Netspace header
             echo "# Netscape HTTP Cookie File" > /tmp/yt-cookies.txt
             echo "# https://curl.haxx.se/rfc/cookie_spec.html" >> /tmp/yt-cookies.txt
             echo "# This is a generated file! Do not edit." >> /tmp/yt-cookies.txt
             echo "" >> /tmp/yt-cookies.txt
-          
-            # Append the actual cookies (preserve all lines, even comments)
             echo "$YOUTUBE_COOKIES" >> /tmp/yt-cookies.txt
-          
             echo "COOKIES_FILE=/tmp/yt-cookies.txt" >> $GITHUB_ENV
-          
-            COOKIE_LINES=$(wc -l < /tmp/yt-cookies.txt)
-            echo "✓ Cookies configured ($COOKIE_LINES lines)"
-          
-            # Verify critical cookies exist
-            if grep -q "LOGIN_INFO" /tmp/yt-cookies.txt; then
-              echo "✓ LOGIN_INFO cookie found (authenticated)"
-            else
-              echo "⚠ WARNING: No LOGIN_INFO cookie - may not be authenticated"
-            fi
-          
-            if grep -q "VISITOR_INFO1_LIVE" /tmp/yt-cookies.txt; then
-              echo "✓ VISITOR_INFO1_LIVE cookie found"
-            fi
-          
-            # Show first line to verify format
-            echo "Cookie file header: $(head -1 /tmp/yt-cookies.txt)"
+            echo "✓ Cookies configured"
           else
-            echo "⚠ No cookies provided - downloads may be rate-limited or fail"
+            echo "⚠ No cookies provided"
           fi
 
       - name: Test yt-dlp with cookies
         run: |
-          echo "Testing yt-dlp configuration..."
-          
           if [ -f "$COOKIES_FILE" ]; then
-            echo "Using cookies from: $COOKIES_FILE"
-            echo "First 3 lines of cookie file:"
-            head -3 "$COOKIES_FILE"
-          
-            # Test with a simple video
             yt-dlp --cookies "$COOKIES_FILE" \
               --js-runtimes deno \
               --remote-components ejs:npm \
-              --extractor-args "youtube:player_client=web" \
               --simulate \
-              "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>&1 | tee test.log
-          
-            if grep -q "Sign in to confirm" test.log; then
-              echo "❌ Cookie authentication failed"
-              exit 1
-            elif grep -q "does not look like a Netscape format" test.log; then
-              echo "❌ Cookie format error"
-              exit 1
-            elif grep -q "n challenge" test.log; then
-              echo "❌ JavaScript challenge failed"
-              exit 1
-            else
-              echo "✅ Test successful"
-            fi
-          else
-            echo "⚠ No cookies file to test"
+              "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+            echo "✅ Test successful"
           fi
 
-      - name: Process pending videos
+      - name: Process pending videos (store in repo)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           python scripts/process.py
 
-      - name: Commit updated videos.json
+      - name: Push videos to repository
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Pull latest changes first
+          git pull --rebase origin ${{ github.ref_name }} || true
+          
+          # Add all video files
+          git add videos/ *.mp4 *.zip .gitattributes
+          
+          # Commit if there are changes
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: add downloaded videos [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ Videos pushed to repository"
+          else
+            echo "No new videos to commit"
+          fi
+
+      - name: Update videos.json statuses
+        run: |
           git add videos.json
           git diff --staged --quiet || \
             git commit -m "chore: update download statuses [skip ci]" && \

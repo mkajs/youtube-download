@@ -2,17 +2,18 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
-import zipfile
 from datetime import date
 from pathlib import Path
-from urllib.parse import quote
 
 VIDEOS_JSON = Path(__file__).parent.parent / "videos.json"
 REPO = os.environ["REPO"]
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
-MAX_PART_BYTES = 1_900 * 1024 * 1024  # 1.9 GB
+# Store videos in a 'videos' directory in the repo
+VIDEOS_DIR = Path(__file__).parent.parent / "videos"
+MAX_FILE_SIZE_MB = 100  # GitHub's soft limit for regular files (use LFS for larger)
 
 
 def run(cmd, **kwargs):
@@ -25,68 +26,41 @@ def is_playlist(url):
     return "playlist?list=" in url or "/playlist/" in url
 
 
-def sanitize_tag_name(title):
-    """Convert title to a valid GitHub tag name"""
-    # GitHub tag rules:
-    # - Must contain only alphanumeric chars, hyphens, periods, underscores
-    # - Cannot start with a period or hyphen
-    # - Maximum 100 characters
-    
-    # Replace spaces and invalid chars with hyphens
-    sanitized = re.sub(r'[^\w\-\.]', '-', title)
-    # Remove consecutive hyphens
-    sanitized = re.sub(r'-+', '-', sanitized)
-    # Remove leading/trailing hyphens and periods
-    sanitized = sanitized.strip('-.')
-    # Convert to lowercase for consistency
-    sanitized = sanitized.lower()
+def sanitize_filename(title):
+    """Convert title to a valid filename"""
+    # Replace invalid characters with underscores
+    sanitized = re.sub(r'[<>:"/\\|?*]', '_', title)
+    # Replace spaces with underscores
+    sanitized = sanitized.replace(' ', '_')
+    # Remove consecutive underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
     # Limit length
-    sanitized = sanitized[:90]
-    
-    # If empty, use fallback
-    if not sanitized:
-        sanitized = "video"
-    
-    return f"yt-{sanitized}"
+    sanitized = sanitized[:100]
+    return sanitized
 
 
 def yt_dlp_cmd(url, output_template, playlist):
     """Generate yt-dlp command with proper cookie handling"""
-    
-    # Use Deno with remote EJS components
+
     js_flags = "--js-runtimes deno --remote-components ejs:npm"
-    
-    # Format: prioritize 720p, then any video with audio
-    # For Rick Astley video, use more permissive format
     fmt = "bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best"
-    
     no_playlist = "" if playlist else "--no-playlist"
-    
-    # Cookies - check if file exists and is readable
+
     cookies = ""
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
         with open(COOKIES_FILE, 'r') as f:
-            first_line = f.readline().strip()
-            if '# Netscape HTTP Cookie File' in first_line:
+            if '# Netscape HTTP Cookie File' in f.readline():
                 cookies = f'--cookies "{COOKIES_FILE}"'
-                print(f"  Using cookies from: {COOKIES_FILE}")
-            else:
-                print(f"  ⚠ Cookie file missing required header")
-    else:
-        print(f"  ⚠ No valid cookies file found")
-    
-    # Use multiple clients for better compatibility
+
     extractor_args = '--extractor-args "youtube:player_client=web,android,ios"'
-    
-    # Mimic a real browser
     user_agent = '--user-agent "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"'
-    
+
     return (
         f'yt-dlp -f "{fmt}" --merge-output-format mp4 '
         f'--retries 10 --fragment-retries 10 --sleep-requests 5 '
         f'--sleep-interval 5 --max-sleep-interval 15 '
         f'--no-check-certificates --geo-bypass '
-        f'--ignore-errors '  # Continue even if some formats fail
+        f'--ignore-errors '
         f'{no_playlist} {cookies} {js_flags} {extractor_args} {user_agent} '
         f'-o "{output_template}" "{url}"'
     )
@@ -103,72 +77,20 @@ def read_info_json(tmpdir):
         return {}
 
 
-def zip_files(files, zip_path):
-    """Create a zip file containing the given files"""
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in files:
-            zf.write(f, f.name)
-    return zip_path
-
-
-def split_and_zip(mp4, tmpdir):
-    """Split large MP4 files into parts and zip each part"""
-    prefix = str(mp4) + ".part"
-    run(f'split -b {MAX_PART_BYTES} "{mp4}" "{prefix}"')
-    parts = sorted(Path(tmpdir).glob(mp4.name + ".part*"))
-    zips = []
-    for i, part in enumerate(parts, 1):
-        zip_path = Path(tmpdir) / f"{mp4.stem}.part{i}.zip"
-        zip_files([part], zip_path)
-        zips.append(zip_path)
-    return zips
-
-
-def release_exists(tag):
-    """Check if a GitHub release already exists"""
-    result = run(f'gh release view "{tag}" --repo "{REPO}"')
-    return result.returncode == 0
-
-
-def create_or_upload_release(tag, title, notes, files):
-    """Create a new release or upload files to existing one"""
-    files_str = " ".join(f'"{f}"' for f in files)
-    notes_escaped = notes.replace('"', '\\"').replace('\n', '\\n')
-    
-    if release_exists(tag):
-        print(f"  Uploading to existing release: {tag}")
-        return run(f'gh release upload "{tag}" {files_str} --repo "{REPO}" --clobber')
-    
-    print(f"  Creating release: {tag}")
-    # Use the original title for the release title (can have spaces)
-    release_title = title[:100]
-    return run(
-        f'gh release create "{tag}" {files_str} '
-        f'--repo "{REPO}" --title "{release_title}" --notes "{notes_escaped}"'
-    )
-
-
-def get_release_url(tag):
-    """Get the URL for a GitHub release"""
-    result = run(f'gh release view "{tag}" --repo "{REPO}" --json url -q .url')
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-
 def process_entry(entry, tmpdir):
-    """Process a single video/playlist entry"""
+    """Process a single video/playlist entry and save to repo"""
     url = entry["url"]
     playlist = is_playlist(url)
-    
+
+    # Create videos directory if it doesn't exist
+    VIDEOS_DIR.mkdir(exist_ok=True)
+
     # Use title in filename for better readability
-    output_template = (
-        "%(playlist_title)s/%(playlist_index)03d-%(title)s.%(ext)s"
-        if playlist
-        else "%(title)s.%(ext)s"
-    )
+    output_template = str(VIDEOS_DIR / "%(title)s.%(ext)s")
 
     print(f"\n📥 Downloading: {url}")
-    result = run(yt_dlp_cmd(url, str(Path(tmpdir) / output_template), playlist))
-    
+    result = run(yt_dlp_cmd(url, output_template, playlist))
+
     if result.returncode != 0:
         error_msg = result.stderr[-1000:].strip()
         print(f"  ❌ ERROR: {error_msg}")
@@ -177,10 +99,10 @@ def process_entry(entry, tmpdir):
         return entry
 
     # Find downloaded MP4 files
-    mp4_files = sorted(Path(tmpdir).rglob("*.mp4"))
+    mp4_files = sorted(VIDEOS_DIR.rglob("*.mp4"))
     if not mp4_files:
         # Check for other video formats
-        other_formats = list(Path(tmpdir).rglob("*.mkv")) + list(Path(tmpdir).rglob("*.webm"))
+        other_formats = list(VIDEOS_DIR.rglob("*.mkv")) + list(VIDEOS_DIR.rglob("*.webm"))
         if other_formats:
             print(f"  Converting {len(other_formats)} files to MP4...")
             for vf in other_formats:
@@ -189,92 +111,112 @@ def process_entry(entry, tmpdir):
                 mp4_files.append(new_name)
         else:
             print("  ❌ ERROR: No video files produced")
-            all_files = list(Path(tmpdir).rglob("*"))
-            print(f"  Files created: {[f.name for f in all_files[:5]]}")
             entry["status"] = "failed"
             entry["error"] = "No video files produced by yt-dlp"
             return entry
 
     # Read metadata
     info = read_info_json(tmpdir)
-    title = info.get("title") or info.get("playlist_title") or Path(mp4_files[0]).stem
-    # Clean title for display (keep original for GitHub release title)
-    display_title = title.strip()
-    # Create safe tag name (no spaces, special chars)
-    safe_tag = sanitize_tag_name(title)
-    
-    print(f"  📝 Title: {display_title}")
-    print(f"  🏷️  Tag: {safe_tag}")
-    print(f"  📁 Files: {len(mp4_files)} video file(s)")
+    title = info.get("title") or Path(mp4_files[0]).stem
+    safe_filename = sanitize_filename(title)
 
-    # Handle playlist vs single video
-    if playlist:
-        pl_id = info.get("playlist_id") or info.get("playlist") or Path(tmpdir).name
-        tag = f"yt-playlist-{pl_id}"[:100]
+    # Rename file to safe name
+    for mp4 in mp4_files:
+        new_name = VIDEOS_DIR / f"{safe_filename}.mp4"
+        if mp4 != new_name:
+            mp4.rename(new_name)
+            print(f"  📝 Renamed to: {safe_filename}.mp4")
 
-        upload_files = []
-        for mp4 in mp4_files:
-            size_mb = mp4.stat().st_size / (1024 * 1024)
-            print(f"  📦 Size: {size_mb:.2f} MB")
-            
-            if mp4.stat().st_size > MAX_PART_BYTES:
-                print(f"  ✂ Splitting large file...")
-                upload_files.extend(split_and_zip(mp4, tmpdir))
-            else:
-                zip_path = Path(tmpdir) / f"{mp4.stem}.zip"
-                upload_files.append(zip_files([mp4], zip_path))
+    file_path = VIDEOS_DIR / f"{safe_filename}.mp4"
+    file_size_mb = file_path.stat().st_size / (1024 * 1024)
 
-        notes = f"Source: {url}\nTotal videos: {len(mp4_files)}"
-    else:
-        # Single video
-        tag = safe_tag
-        mp4 = mp4_files[0]
-        size_mb = mp4.stat().st_size / (1024 * 1024)
-        print(f"  📦 Size: {size_mb:.2f} MB")
+    print(f"  📝 Title: {title}")
+    print(f"  📁 File: {safe_filename}.mp4")
+    print(f"  📦 Size: {file_size_mb:.2f} MB")
 
-        if mp4.stat().st_size > MAX_PART_BYTES:
-            print(f"  ✂ Splitting large file...")
-            upload_files = split_and_zip(mp4, tmpdir)
-            notes = f"Source: {url}\nSplit into {len(upload_files)} parts"
-        else:
-            zip_path = Path(tmpdir) / f"{safe_tag}.zip"
-            upload_files = [zip_files([mp4], zip_path)]
-            notes = f"Source: {url}"
+    # Create a metadata file
+    metadata = {
+        "original_url": url,
+        "title": title,
+        "filename": f"{safe_filename}.mp4",
+        "file_size_mb": round(file_size_mb, 2),
+        "downloaded_at": date.today().isoformat(),
+        "video_id": info.get("id"),
+        "uploader": info.get("uploader"),
+        "upload_date": info.get("upload_date"),
+        "duration": info.get("duration"),
+        "view_count": info.get("view_count")
+    }
 
-    # Create release and upload files
-    result = create_or_upload_release(tag, display_title, notes, upload_files)
-    if result.returncode != 0:
-        error_msg = result.stderr[-500:].strip()
-        print(f"  ❌ ERROR uploading: {error_msg}")
-        entry["status"] = "failed"
-        entry["error"] = error_msg
-        return entry
+    metadata_path = VIDEOS_DIR / f"{safe_filename}.json"
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    print(f"  📄 Metadata saved: {safe_filename}.json")
+
+    # For very large files, provide split instructions instead of storing
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        print(f"  ⚠️ File exceeds {MAX_FILE_SIZE_MB}MB. Consider using Git LFS or external storage.")
+
+        # Create a README for large files
+        readme_path = VIDEOS_DIR / f"{safe_filename}_README.txt"
+        with open(readme_path, 'w') as f:
+            f.write(f"File: {safe_filename}.mp4\n")
+            f.write(f"Size: {file_size_mb:.2f} MB\n")
+            f.write(f"Source: {url}\n")
+            f.write(f"Downloaded: {date.today().isoformat()}\n\n")
+            f.write("This file is too large for GitHub. Use git-lfs or download manually.\n")
+            f.write(f"yt-dlp command to download: yt-dlp -f best[height<=720] \"{url}\"\n")
 
     entry["status"] = "done"
-    entry["title"] = display_title
-    entry["release_tag"] = tag
-    entry["release_url"] = get_release_url(tag)
+    entry["title"] = title
+    entry["filename"] = f"{safe_filename}.mp4"
+    entry["file_size_mb"] = round(file_size_mb, 2)
     entry["downloaded_at"] = date.today().isoformat()
-    print(f"  ✅ Done: {entry['release_url']}")
+    entry["storage_path"] = str(file_path)
+
+    print(f"  ✅ Done: Saved to {file_path}")
     return entry
+
+
+def update_readme(videos):
+    """Generate a README file listing all downloaded videos"""
+    readme_path = Path(__file__).parent.parent / "VIDEOS.md"
+
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write("# Downloaded Videos\n\n")
+        f.write("This file lists all videos downloaded by the automated workflow.\n\n")
+        f.write("## Videos\n\n")
+
+        successful = [v for v in videos if v.get("status") == "done"]
+
+        for video in successful:
+            f.write(f"### {video.get('title', 'Unknown')}\n")
+            f.write(f"- **URL**: {video.get('url', 'N/A')}\n")
+            f.write(f"- **Filename**: `{video.get('filename', 'N/A')}`\n")
+            f.write(f"- **Size**: {video.get('file_size_mb', 0):.2f} MB\n")
+            f.write(f"- **Downloaded**: {video.get('downloaded_at', 'N/A')}\n")
+            f.write("\n")
+
+    print(f"📄 Updated VIDEOS.md with {len(successful)} videos")
 
 
 def main():
     """Main entry point"""
     print("=" * 60)
-    print("🎬 YouTube Download Script")
+    print("🎬 YouTube Download Script (Direct Repository Storage)")
     print("=" * 60)
-    
+
     if not VIDEOS_JSON.exists():
         print(f"❌ Error: {VIDEOS_JSON} not found")
         exit(1)
-    
+
     try:
         videos = json.loads(VIDEOS_JSON.read_text())
     except json.JSONDecodeError as e:
         print(f"❌ Error parsing videos.json: {e}")
         exit(1)
-    
+
     pending = [v for v in videos if v.get("status") == "pending"]
 
     if not pending:
@@ -282,33 +224,49 @@ def main():
         return
 
     print(f"\n📋 Processing {len(pending)} video(s)...")
-    
+
     for i, entry in enumerate(pending, 1):
         print(f"\n{'─' * 60}")
         print(f"📌 [{i}/{len(pending)}]")
         print(f"{'─' * 60}")
-        
+
         with tempfile.TemporaryDirectory() as tmpdir:
             process_entry(entry, tmpdir)
-        
+
         VIDEOS_JSON.write_text(json.dumps(videos, indent=2, ensure_ascii=False) + "\n")
+        print(f"💾 Progress saved")
+
+    # Update README with downloaded videos
+    update_readme(videos)
+
+    # Create .gitignore for videos directory if not exists
+    gitignore_path = VIDEOS_DIR / ".gitignore"
+    if not gitignore_path.exists():
+        with open(gitignore_path, 'w') as f:
+            f.write("# Video files are tracked via Git LFS\n")
+            f.write("*.mp4 filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.zip filter=lfs diff=lfs merge=lfs -text\n")
 
     # Summary
     successful = [v for v in videos if v.get("status") == "done"]
     failed = [v for v in videos if v.get("status") == "failed"]
-    
+
     print("\n" + "=" * 60)
     print("📊 SUMMARY")
     print("=" * 60)
-    print(f"✅ Successful: {len(successful)}")
+    print(f"✅ Downloaded: {len(successful)} video(s)")
     print(f"❌ Failed: {len(failed)}")
-    
+
     for f in failed:
         print(f"  - {f.get('url')}: {f.get('error', 'Unknown')[:100]}")
-    
+
+    if successful:
+        print(f"\n📁 Videos saved in the 'videos/' directory of this repository")
+        print(f"📄 See VIDEOS.md for the complete list")
+
     if failed:
         exit(1)
-    
+
     print("\n🎉 All done!")
 
 
