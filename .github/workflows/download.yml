@@ -19,29 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install latest QuickJS from source
-        run: |
-          # Remove old version if exists
-          sudo apt-get remove -y quickjs || true
-          
-          # Install build dependencies
-          sudo apt-get update
-          sudo apt-get install -y git make gcc libc6-dev
-          
-          # Clone and build latest QuickJS
-          git clone https://github.com/bellard/quickjs.git /tmp/quickjs
-          cd /tmp/quickjs
-          make
-          
-          # Install to /usr/local/bin
-          sudo cp qjs qjsc /usr/local/bin/
-          
-          # Verify installation
-          /usr/local/bin/qjs --help | head -5
-          echo "QuickJS installed successfully"
-          
-          # Show version info (newer versions support --version)
-          /usr/local/bin/qjs -e "console.log('QuickJS version:', typeof version !== 'undefined' ? version : 'unknown')"
+      - name: Install Deno (JavaScript runtime for yt-dlp)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
 
       - name: Install yt-dlp
         run: |
@@ -55,33 +36,27 @@ jobs:
           if [ -n "$YOUTUBE_COOKIES" ]; then
             echo "$YOUTUBE_COOKIES" > /tmp/yt-cookies.txt
             echo "COOKIES_FILE=/tmp/yt-cookies.txt" >> $GITHUB_ENV
-            echo "Cookies file configured"
-            ls -la /tmp/yt-cookies.txt
+            echo "✓ Cookies file configured"
           else
-            echo "No cookies provided - downloads may be limited"
+            echo "⚠ No cookies provided - downloads may be rate-limited"
           fi
 
-      - name: Test yt-dlp with QuickJS
+      - name: Test yt-dlp configuration
         run: |
-          echo "Testing yt-dlp with QuickJS runtime..."
-          # Test with a simple public video
-          yt-dlp --js-runtimes /usr/local/bin/qjs --simulate \
-            --extractor-args "youtube:player_client=web" \
+          echo "Testing yt-dlp with Deno and remote EJS components..."
+          yt-dlp --js-runtimes deno --remote-components ejs:npm --simulate \
             "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>&1 | tee test.log
           
-          # Check if test passed
           if grep -q "n challenge" test.log; then
-            echo "ERROR: QuickJS not working properly"
+            echo "❌ Challenge solving failed"
             exit 1
           fi
-          echo "Test successful"
+          echo "✓ Test successful"
 
       - name: Process pending videos
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          # Set explicit path to QuickJS
-          YTDLP_JS_RUNTIME: /usr/local/bin/qjs
         run: |
           python scripts/process.py
 
